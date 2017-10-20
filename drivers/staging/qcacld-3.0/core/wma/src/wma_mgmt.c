@@ -682,6 +682,11 @@ void wma_set_sta_sa_query_param(tp_wma_handle wma,
 
 	WMA_LOGD(FL("Enter:"));
 
+	if (!mac) {
+		WMA_LOGE(FL("mac context is NULL"));
+		return;
+	}
+
 	if (wlan_cfg_get_int
 		    (mac, WNI_CFG_PMF_SA_QUERY_MAX_RETRIES,
 		    &max_retries) != eSIR_SUCCESS) {
@@ -1221,7 +1226,8 @@ QDF_STATUS wma_send_peer_assoc(tp_wma_handle wma,
 	 * Limit nss to max number of rf chain supported by target
 	 * Otherwise Fw will crash
 	 */
-	wma_update_txrx_chainmask(wma->num_rf_chains, &cmd->peer_nss);
+	if (cmd->peer_nss > WMA_MAX_NSS)
+		cmd->peer_nss = WMA_MAX_NSS;
 
 	intr->nss = cmd->peer_nss;
 	cmd->peer_phymode = phymode;
@@ -2504,7 +2510,7 @@ void wma_send_beacon(tp_wma_handle wma, tpSendbeaconParams bcn_info)
 		if (bcn_info->p2pIeOffset) {
 			p2p_ie = bcn_info->beacon + bcn_info->p2pIeOffset;
 			WMA_LOGI
-				(" %s: p2pIe is present - vdev_id %hu, p2p_ie = %p, p2p ie len = %hu",
+				(" %s: p2pIe is present - vdev_id %hu, p2p_ie = %pK, p2p ie len = %hu",
 				__func__, vdev_id, p2p_ie, p2p_ie[1]);
 			if (wma_p2p_go_set_beacon_ie(wma, vdev_id, p2p_ie) < 0) {
 				WMA_LOGE
@@ -2526,9 +2532,8 @@ void wma_send_beacon(tp_wma_handle wma, tpSendbeaconParams bcn_info)
 		if (!wma->interfaces[vdev_id].vdev_up) {
 			param.vdev_id = vdev_id;
 			param.assoc_id = 0;
-			status = wmi_unified_vdev_up_send(wma->wmi_handle,
-					bcn_info->bssId,
-					&param);
+			status = wma_send_vdev_up_to_fw(wma, &param,
+							bcn_info->bssId);
 			if (QDF_IS_STATUS_ERROR(status)) {
 				WMA_LOGE(FL("failed to send vdev up"));
 				cds_set_do_hw_mode_change_flag(false);
@@ -2631,9 +2636,11 @@ static int wma_process_mgmt_tx_completion(tp_wma_handle wma_handle,
 		packetdump_cb(wmi_desc->nbuf, QDF_STATUS_SUCCESS,
 			wmi_desc->vdev_id, TX_MGMT_PKT);
 
-	if (wmi_desc->tx_cmpl_cb)
+	if (wmi_desc->tx_cmpl_cb) {
 		wmi_desc->tx_cmpl_cb(wma_handle->mac_context,
 					   wmi_desc->nbuf, 1);
+		wmi_desc->nbuf = NULL;
+	}
 
 	if (wmi_desc->ota_post_proc_cb)
 		wmi_desc->ota_post_proc_cb((tpAniSirGlobal)
@@ -2761,7 +2768,8 @@ void wma_process_update_rx_nss(tp_wma_handle wma_handle,
 		&wma_handle->interfaces[update_rx_nss->smesessionId];
 	int rx_nss = update_rx_nss->rxNss;
 
-	wma_update_txrx_chainmask(wma_handle->num_rf_chains, &rx_nss);
+	if (rx_nss > WMA_MAX_NSS)
+		rx_nss = WMA_MAX_NSS;
 
 	intr->nss = (uint8_t)rx_nss;
 	update_rx_nss->rxNss = (uint32_t)rx_nss;
@@ -3271,6 +3279,7 @@ end:
 	return should_drop;
 }
 
+#define RATE_LIMIT 16
 /**
  * wma_mgmt_rx_process() - process management rx frame.
  * @handle: wma handle
@@ -3293,6 +3302,9 @@ static int wma_mgmt_rx_process(void *handle, uint8_t *data,
 	uint8_t mgt_type, mgt_subtype;
 	int status;
 	tp_wma_packetdump_cb packetdump_cb;
+	static uint8_t limit_prints_invalid_len = RATE_LIMIT - 1;
+	static uint8_t limit_prints_load_unload = RATE_LIMIT - 1;
+	static uint8_t limit_prints_recovery = RATE_LIMIT - 1;
 
 	if (!wma_handle) {
 		WMA_LOGE("%s: Failed to get WMA  context", __func__);
@@ -3312,17 +3324,29 @@ static int wma_mgmt_rx_process(void *handle, uint8_t *data,
 	}
 
 	if (hdr->buf_len < sizeof(struct ieee80211_frame)) {
-		WMA_LOGE("Invalid rx mgmt packet");
+		limit_prints_invalid_len++;
+		if (limit_prints_invalid_len == RATE_LIMIT) {
+			WMA_LOGD("Invalid rx mgmt packet");
+			limit_prints_invalid_len = 0;
+		}
 		return -EINVAL;
 	}
 
 	if (cds_is_load_or_unload_in_progress()) {
-		WMA_LOGW(FL("Load/Unload in progress"));
+		limit_prints_load_unload++;
+		if (limit_prints_load_unload == RATE_LIMIT) {
+			WMA_LOGD(FL("Load/Unload in progress"));
+			limit_prints_load_unload = 0;
+		}
 		return -EINVAL;
 	}
 
 	if (cds_is_driver_recovering()) {
-		WMA_LOGW(FL("Recovery in progress"));
+		limit_prints_recovery++;
+		if (limit_prints_recovery == RATE_LIMIT) {
+			WMA_LOGD(FL("Recovery in progress"));
+			limit_prints_recovery = 0;
+		}
 		return -EINVAL;
 	}
 
@@ -3437,14 +3461,15 @@ static int wma_mgmt_rx_process(void *handle, uint8_t *data,
 			if (iface->rmfEnabled) {
 				status = wma_process_rmf_frame(wma_handle,
 					iface, wh, rx_pkt, wbuf);
+				if (status)
+					return status;
 				/*
 				 * CCMP header might have been pulled off
 				 * reinitialize the start pointer of mac header
 				 */
 				wh = (struct ieee80211_frame *)
 						qdf_nbuf_data(wbuf);
-				if (status != 0)
-					return status;
+
 			}
 		}
 	}
