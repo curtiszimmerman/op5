@@ -1448,7 +1448,7 @@ static struct device_attribute qpnp_hap_attrs[] = {
 	__ATTR(vmax, (S_IRUGO | S_IWUSR | S_IWGRP),
 			qpnp_hap_vmax_show,
 			qpnp_hap_vmax_store),
-	__ATTR(vmax_mv_strong, (S_IRUGO | S_IWUSR | S_IWGRP),
+	__ATTR(vmax_mv_strong, (S_IRUGO | S_IWUSR),
 			qpnp_hap_vmax_mv_strong_show,
 			qpnp_hap_vmax_mv_strong_store),
 	__ATTR(wf_s0, 0664, qpnp_hap_wf_s0_show, qpnp_hap_wf_s0_store),
