@@ -1,2 +1,2 @@
-obj-y += coretech_helper.o
+obj-$(CONFIG_OPCHAIN) += coretech_helper.o
 obj-y += opchain/
